@@ -19,17 +19,25 @@
 
 package io.temporal.samples.hello;
 
+import io.temporal.api.common.v1.WorkflowExecution;
+import io.temporal.api.workflowservice.v1.TerminateWorkflowExecutionRequest;
 import io.temporal.client.WorkflowClient;
+import io.temporal.client.WorkflowFailedException;
 import io.temporal.client.WorkflowOptions;
+import io.temporal.client.WorkflowStub;
 import io.temporal.serviceclient.WorkflowServiceStubs;
+import io.temporal.testing.TestEnvironmentOptions;
+import io.temporal.testing.TestWorkflowEnvironment;
 import io.temporal.worker.Worker;
 import io.temporal.worker.WorkerFactory;
+import io.temporal.worker.WorkerFactoryOptions;
 import io.temporal.workflow.SignalMethod;
 import io.temporal.workflow.Workflow;
 import io.temporal.workflow.WorkflowInterface;
 import io.temporal.workflow.WorkflowMethod;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Sample Temporal workflow that demonstrates how to use workflow signal methods to signal from
@@ -107,24 +115,50 @@ public class HelloSignal {
     }
   }
 
+  private static WorkflowClient getRealWorkflowClient() {
+    WorkflowServiceStubs service = WorkflowServiceStubs.newInstance();
+    return WorkflowClient.newInstance(service);
+  }
+
+  private static WorkerFactory getRealWorkerFactory(WorkflowClient client) {
+    return WorkerFactory.newInstance(client);
+  }
+
+  private static TestWorkflowEnvironment testEnv;
+
+  private static WorkflowClient getTestWorkflowClient() {
+    testEnv =
+        TestWorkflowEnvironment.newInstance(
+            TestEnvironmentOptions.newBuilder()
+                .setWorkerFactoryOptions(WorkerFactoryOptions.newBuilder().build())
+                .build());
+
+    return testEnv.getWorkflowClient();
+  }
+
+  private static WorkerFactory getTestWorkerFactory() {
+    return testEnv.getWorkerFactory();
+  }
+
   /**
    * With the Workflow and Activities defined, we can now start execution. The main method starts
    * the worker and then the workflow.
    */
   public static void main(String[] args) throws Exception {
 
-    // Get a Workflow service stub.
-    WorkflowServiceStubs service = WorkflowServiceStubs.newInstance();
-
     /*
      * Get a Workflow service client which can be used to start, Signal, and Query Workflow Executions.
      */
-    WorkflowClient client = WorkflowClient.newInstance(service);
-
-    /*
-     * Define the workflow factory. It is used to create workflow workers for a specific task queue.
-     */
-    WorkerFactory factory = WorkerFactory.newInstance(client);
+    WorkflowClient client;
+    WorkerFactory factory;
+    boolean useReal = false;
+    if (useReal) {
+      client = getRealWorkflowClient();
+      factory = getRealWorkerFactory(client);
+    } else {
+      client = getTestWorkflowClient();
+      factory = getTestWorkerFactory();
+    }
 
     /*
      * Define the workflow worker. Workflow workers listen to a defined task queue and process
@@ -150,44 +184,35 @@ public class HelloSignal {
         WorkflowOptions.newBuilder().setTaskQueue(TASK_QUEUE).setWorkflowId(WORKFLOW_ID).build();
 
     // Create the workflow client stub. It is used to start the workflow execution.
-    GreetingWorkflow workflow = client.newWorkflowStub(GreetingWorkflow.class, workflowOptions);
+    WorkflowStub workflow = client.newUntypedWorkflowStub("GreetingWorkflow", workflowOptions);
 
     // Start workflow asynchronously and call its getGreeting workflow method
-    WorkflowClient.start(workflow::getGreetings);
+    WorkflowExecution execution = workflow.start();
 
-    // After start for getGreeting returns, the workflow is guaranteed to be started.
-    // So we can send a signal to it using the workflow stub.
-    // This workflow keeps receiving signals until exit is called
+    // Don't send any signals - just let the workflow sit there so we can terminate it and see what
+    // happens.
 
-    // When the workflow is started the getGreetings will block for the previously defined
-    // conditions
-    // Send the first workflow signal
-    workflow.waitForName("World");
+    TerminateWorkflowExecutionRequest terminateWorkflowExecutionRequest =
+        TerminateWorkflowExecutionRequest.newBuilder()
+            .setReason("testing")
+            .setWorkflowExecution(execution)
+            .setNamespace("default")
+            .build();
 
-    /*
-     * Here we create a new workflow stub using the same workflow id.
-     * We do this to demonstrate that to send a signal to an already running workflow
-     * you only need to know its workflow id.
-     */
-    GreetingWorkflow workflowById = client.newWorkflowStub(GreetingWorkflow.class, WORKFLOW_ID);
+    client
+        .getWorkflowServiceStubs()
+        .blockingStub()
+        .terminateWorkflowExecution(terminateWorkflowExecutionRequest);
 
-    // Send the second signal to our workflow
-    workflowById.waitForName("Universe");
-
-    // Now let's send our exit signal to the workflow
-    workflowById.exit();
-
-    /*
-     * We now call our getGreetings workflow method synchronously after our workflow has started.
-     * This reconnects our workflowById workflow stub to the existing workflow and blocks until
-     * a result is available. Note that this behavior assumes that WorkflowOptions are not configured
-     * with WorkflowIdReusePolicy.AllowDuplicate. If they were, this call would fail with the
-     * WorkflowExecutionAlreadyStartedException exception.
-     */
-    List<String> greetings = workflowById.getGreetings();
-
-    // Print our two greetings which were sent by signals
-    System.out.println(greetings);
-    System.exit(0);
+    try {
+      System.out.println("Calling getResult");
+      workflow.getResult(5_000, TimeUnit.MILLISECONDS, List.class);
+      throw new RuntimeException("getResult should have thrown a TerminatedFailure");
+    } catch (WorkflowFailedException e) {
+      System.out.println("getResult failed-fast as expected");
+      // This is expected
+    } finally {
+      factory.shutdown();
+    }
   }
 }
